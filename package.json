@@ -10,7 +10,6 @@
     "url": "https://github.com/ai-tribunsky/one2trip"
   },
   "dependencies": {
-    "redis": "2.6.*",
-    "node-uuid": "1.4.*"
+    "redis": "2.6.*"
   }
 }
