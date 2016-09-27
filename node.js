@@ -2,51 +2,56 @@
 'use strict';
 
 const redis = require('redis');
-const redisClient = redis.createClient({
+const redisOptions = {
   host: '127.0.0.1',
   port: 6379,
   db: 1,
   prefix: 'one2trip:'
-});
+};
 
-// Node for distributed message processing
-var Node = function (redisClient) {
+// Node for distributed messages processing
+var Node = function (redisOptions) {
   const EVENTS_QUEUE = 'nodes:queue';
-  const NODES_LIST = 'nodes:ids:list';
-  const NODES_TABLE = 'nodes:table';
+  const NODES_IDS_LIST = 'nodes:ids';
+  const NODES_LIST = 'nodes:list';
   const NODES_EMITTER = 'nodes:emitter';
   const NODES_KEY_TTL = 10; // sec
-  const EVENT_SENDING_INTERVAL = 500; // ms
+  const EVENT_EMITTING_INTERVAL = 500; // ms
   const NODE_HEALTH_CHECK_INTERVAL = 200; // ms
   const NODE_ACTIVITY_THRESHOLD = 1000; // ms
 
-  var workLoopInterval;
-
-  redisClient.on('error', function (error) {
-    _log('Redis error: ' + error);
-    clearInterval(workLoopInterval);
-  });
-
   var id = 'node-' + (new Date()).getTime() + '-' + Math.round(Math.random() * 1000);
+  var isEmitter = false;
+  var emitEventInterval;
+  var receiveEventInterval;
+
+  const redisClient = redis.createClient(redisOptions);
+  redisClient.on('error', function (error) {
+    _log('[ERROR] Redis:', error);
+    clearInterval(emitEventInterval);
+    clearInterval(receiveEventInterval);
+  });
 
   function run() {
     _registerNode();
+    _checkEmitter();
 
-    var workLoop = function _workLoop () {
-      redisClient.get(NODES_EMITTER, function (error, emitterId) {
-        if (error) {
-          _log(error);
-          return;
-        }
-
-        if (emitterId === id) {
+    emitEventInterval = setInterval(
+      function _emitEventLoop() {
+        if (isEmitter) {
           _emitEvent();
-        } else {
+        }
+      },
+      EVENT_EMITTING_INTERVAL
+    );
+    receiveEventInterval = setInterval(
+      function _receiveEventLoop() {
+        if (!isEmitter) {
           _receiveEvent();
         }
-      });
-    };
-    workLoopInterval = setInterval(workLoop, 0);
+      },
+      0
+    );
 
     _nodesHealthCheck();
   }
@@ -56,21 +61,32 @@ var Node = function (redisClient) {
 
     var lastActivity = (new Date()).getTime();
     redisClient.multi()
-      .hset(NODES_TABLE, id, lastActivity, function (error) {
+      .hset(NODES_LIST, id, lastActivity, function (error) {
         if (error) {
-          _log('Add node to nodes list failed: ' + error);
+          _log('[ERROR] Adding node to nodes list failed:', error);
         }
       })
-      .rpush(NODES_LIST, id, function (error) {
+      .rpush(NODES_IDS_LIST, id, function (error) {
         if (error) {
-          _log('Add node id to nodes ids list failed: ' + error);
+          _log('[ERROR] Adding node id to nodes ids list failed:', error);
         }
       })
       .exec(function (error) {
         if (error) {
-          _log('Node registration failed: ' + error);
+          _log('[ERROR] Node registration failed:', error);
         }
       });
+  }
+
+  function _checkEmitter() {
+    redisClient.get(NODES_EMITTER, function (error, emitterId) {
+      if (error) {
+        _log('[ERROR] Checking emitter failed:', error);
+      } else {
+        isEmitter = emitterId === id;
+        _checkEmitter();
+      }
+    });
   }
 
   function _emitEvent() {
@@ -81,16 +97,15 @@ var Node = function (redisClient) {
         if (!error && reply) {
           _log('Event "' + message + '" was emitted');
         } else {
-          _log('Error occurred during event emitting: ' + error + ' Reply: ' + reply);
+          _log('[ERROR] Event emitting failed:', error, 'Reply:' + reply);
         }
       })
-      .hset(NODES_TABLE, id, lastActivity)
-      .exec(function (error) {
+      .hset(NODES_LIST, id, lastActivity, function (error) {
         if (error) {
-          _log('Error occurred during event enqueue or node last activity updating');
-          _log(error);
+          _log('[ERROR] Updating node last activity failed:', error);
         }
-      });
+      })
+      .exec();
   }
 
   var cnt = 0;
@@ -115,7 +130,7 @@ var Node = function (redisClient) {
   function _receiveEvent() {
     var eventHandlerCallback = function (error, event) {
       if (error) {
-        _log('Event "' + event + '" was processed with error');
+        _log('Event "' + event + '" was processed with an error');
       } else {
         _log('Event "' + event + '" was processed successfully');
       }
@@ -123,22 +138,22 @@ var Node = function (redisClient) {
 
     var lastActivity = (new Date()).getTime();
     redisClient.batch()
-      .hset(NODES_TABLE, id, lastActivity)
       .lpop(EVENTS_QUEUE, function (error, reply) {
         if (null === reply) {
           return;
         }
         if (error) {
-          _log('Error occurred during events dequeue: ' + error);
-          return;
+          _log('[ERROR] Event dequeueing failed:', error);
+        } else {
+          _eventHandler(reply, eventHandlerCallback);
         }
-        _eventHandler(reply, eventHandlerCallback);
       })
-      .exec(function (error) {
+      .hset(NODES_LIST, id, lastActivity, function (error) {
         if (error) {
-          _log('Error occurred during events dequeue or node last activity updating: ' + error);
+          _log('[ERROR] Updating node last activity failed:', error);
         }
-      });
+      })
+      .exec();
   }
 
   function _nodesHealthCheck() {
@@ -146,18 +161,18 @@ var Node = function (redisClient) {
       redisClient.batch()
         .get(NODES_EMITTER, function (error, emitterId) {
           if (error) {
-            _log(error);
+            _log('[ERROR] Getting emitter failed:', error);
             return;
           }
 
           if (null === emitterId || '' === emitterId) {
-            _log('Emitter not found');
+            _log('Emitter is not found');
             _assignEmitter();
           }
 
-          redisClient.hgetall(NODES_TABLE, function (error, nodesList) {
+          redisClient.hgetall(NODES_LIST, function (error, nodesList) {
             if (error) {
-              _log('Getting node list failed: ' + error);
+              _log('[ERROR] Getting node list failed:', error);
               return;
             }
 
@@ -170,26 +185,26 @@ var Node = function (redisClient) {
               }
 
               var multiExec = redisClient.multi()
-                .hdel(NODES_TABLE, nodeId, function (error) {
+                .hdel(NODES_LIST, nodeId, function (error) {
                   if (error) {
-                    _log('Removing node from node list failed: ' + error);
+                    _log('[ERROR] Removing node from node list failed:', error);
                   }
                 })
-                .lrem(NODES_LIST, 0, nodeId, function (error) {
+                .lrem(NODES_IDS_LIST, 0, nodeId, function (error) {
                   if (error) {
-                    _log('Removing node id from node ids list failed: ' + error);
+                    _log('[ERROR] Removing node id from node ids list failed:', error);
                   }
                 });
               if (emitterId === nodeId) {
                 multiExec.set(NODES_EMITTER, '', function (error) {
                   if (error) {
-                    _log('Clean up emitter failed: ' + error);
+                    _log('[ERROR] Unsetting emitter failed:', error);
                   }
                 });
               }
               multiExec.exec(function (error) {
                 if (error) {
-                  _log('Remove inactive node failed: ' + error);
+                  _log('[ERROR] Removing inactive node failed:', error);
                   return;
                 }
 
@@ -202,12 +217,12 @@ var Node = function (redisClient) {
           });
         })
         .expire(NODES_EMITTER, NODES_KEY_TTL)
+        .expire(NODES_IDS_LIST, NODES_KEY_TTL)
         .expire(NODES_LIST, NODES_KEY_TTL)
-        .expire(NODES_TABLE, NODES_KEY_TTL)
         .expire(EVENTS_QUEUE, NODES_KEY_TTL)
         .exec(function (error) {
           if (error) {
-            _log('Error occurred during health check: ' + error);
+            _log('[ERROR] Error occurred during health checking:', error);
           }
         });
     };
@@ -215,10 +230,9 @@ var Node = function (redisClient) {
   }
 
   function _assignEmitter() {
-    redisClient.lindex(NODES_LIST, 0, function (error, id) {
+    redisClient.lindex(NODES_IDS_LIST, 0, function (error, id) {
       if (error) {
-        _log('Assign new emitter failed');
-        _log(error);
+        _log('[ERROR] Getting potential node-emitter failed:', error);
         return;
       }
 
@@ -227,20 +241,32 @@ var Node = function (redisClient) {
         redisClient.batch()
           .set(NODES_EMITTER, id, function (error) {
             if (error) {
-              _log('Assign new emitter failed: ' + error);
+              _log('[ERROR] Assigning new emitter failed:', error);
             }
           })
-          .hset(NODES_TABLE, id, lastActivity)
-          .exec();
+          .hset(NODES_LIST, id, lastActivity, function (error) {
+            if (error) {
+              _log('[ERROR] Updating emitter node activity failed:', error);
+            }
+          })
+          .exec(function (error) {
+            if (!error) {
+              _log('New emitter: ' + id);
+            }
+          });
       }
     });
   }
 
-  function _log(message) {
-    if (message instanceof Object) {
-      message = JSON.stringify(message, null, 4);
+  function _log() {
+    var i, message;
+    for (i in arguments) {
+      message = arguments[i];
+      if (message instanceof Object) {
+        message = JSON.stringify(message, null, 4);
+      }
+      console.log(message);
     }
-    console.log(message);
   }
 
   return {
@@ -248,4 +274,4 @@ var Node = function (redisClient) {
   };
 };
 
-Node(redisClient).run();
+Node(redisOptions).run();
