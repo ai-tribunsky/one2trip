@@ -1,23 +1,22 @@
-#!/usr/bin/env node
 'use strict';
 
-const argv = require('minimist')(process.argv.slice(2));
-const redis = require('redis');
+var argv = require('minimist')(process.argv.slice(2));
+var redis = require('redis');
 
 // Node for distributed messages processing
 exports.node = function (argv) {
-  const EVENTS_QUEUE = 'nodes:queue';
-  const EVENTS_ERRORS_LIST = 'nodes:errors';
-  const EVENTS_ERRORS_LIST_TTL = 86400; // sec
-  const NODES_IDS_LIST = 'nodes:ids';
-  const NODES_LIST = 'nodes:list';
-  const NODES_EMITTER = 'nodes:emitter';
-  const NODES_KEY_TTL = 10; // sec
-  const EVENT_EMITTING_INTERVAL = 500; // ms
-  const NODE_HEALTH_CHECK_INTERVAL = 200; // ms
-  const NODE_ACTIVITY_THRESHOLD = 1000; // ms
+  var EVENTS_QUEUE = 'nodes:queue';
+  var EVENTS_ERRORS_LIST = 'nodes:errors';
+  var EVENTS_ERRORS_LIST_TTL = 86400; // sec
+  var NODES_IDS_LIST = 'nodes:ids';
+  var NODES_LIST = 'nodes:list';
+  var NODES_EMITTER = 'nodes:emitter';
+  var NODES_KEY_TTL = 10; // sec
+  var EVENT_EMITTING_INTERVAL = 500; // ms
+  var NODE_HEALTH_CHECK_INTERVAL = 200; // ms
+  var NODE_ACTIVITY_THRESHOLD = 1000; // ms
 
-  var id = 'node-' + (new Date()).getTime() + '-' + Math.round(Math.random() * 1000);
+  var id = 'node-' + Date.now() + '-' + Math.round(Math.random() * 1000);
   var isEmitter = false;
   var emitEventInterval;
   var receiveEventInterval;
@@ -65,27 +64,25 @@ exports.node = function (argv) {
   }
 
   function _getErrors(onComplete) {
-    redisClient.lrange(EVENTS_ERRORS_LIST, 0, -1, function (error, errorsList) {
+    redisClient.rpop(EVENTS_ERRORS_LIST, function (error, event) {
       if (error) {
-        _log('[ERROR] Getting errors list failed:', error);
+        _log('[ERROR] Getting event with error failed:', error);
         return;
       }
-      if (null === errorsList || 0 === errorsList.length) {
+      if (null === event) {
         _log('Errors list is empty');
-      } else {
-        var i;
-        for (i in errorsList) {
-          _log(errorsList[i]);
-        }
+        onComplete();
+        return;
       }
-      onComplete();
+      _log(event);
+      _getErrors(onComplete);
     });
   }
 
   function _registerNode() {
     _log('Register node: ' + id);
 
-    var lastActivity = (new Date()).getTime();
+    var lastActivity = Date.now();
     redisClient.multi()
       .hset(NODES_LIST, id, lastActivity, function (error) {
         if (error) {
@@ -117,7 +114,7 @@ exports.node = function (argv) {
 
   function _emitEvent() {
     var message = _getMessage();
-    var lastActivity = (new Date()).getTime();
+    var lastActivity = Date.now();
     redisClient.batch()
       .rpush(EVENTS_QUEUE, message, function (error, reply) {
         if (!error && reply) {
@@ -163,7 +160,7 @@ exports.node = function (argv) {
       }
     };
 
-    var lastActivity = (new Date()).getTime();
+    var lastActivity = Date.now();
     redisClient.batch()
       .lpop(EVENTS_QUEUE, function (error, reply) {
         if (null === reply) {
@@ -215,31 +212,36 @@ exports.node = function (argv) {
               return;
             }
 
-            var nodeId, lastActivity, now;
+            var nodeId;
+            var lastActivity;
+            var now;
+            var removeNodeCallback = function (error) {
+              if (error) {
+                _log('[ERROR] Removing node from node list failed:', error);
+              }
+            };
+            var removeNodeIdCallback = function (error) {
+              if (error) {
+                _log('[ERROR] Removing node id from node ids list failed:', error);
+              }
+            };
+            var unsettingEmitterCallback = function (error) {
+              if (error) {
+                _log('[ERROR] Unsetting emitter failed:', error);
+              }
+            };
             for (nodeId in nodesList) {
-              now = (new Date()).getTime();
+              now = Date.now();
               lastActivity = parseInt(nodesList[nodeId], 10);
               if (now - lastActivity < NODE_ACTIVITY_THRESHOLD) {
                 continue;
               }
 
               var multiExec = redisClient.multi()
-                .hdel(NODES_LIST, nodeId, function (error) {
-                  if (error) {
-                    _log('[ERROR] Removing node from node list failed:', error);
-                  }
-                })
-                .lrem(NODES_IDS_LIST, 0, nodeId, function (error) {
-                  if (error) {
-                    _log('[ERROR] Removing node id from node ids list failed:', error);
-                  }
-                });
+                .hdel(NODES_LIST, nodeId, removeNodeCallback)
+                .lrem(NODES_IDS_LIST, 0, nodeId, removeNodeIdCallback);
               if (emitterId === nodeId) {
-                multiExec.set(NODES_EMITTER, '', function (error) {
-                  if (error) {
-                    _log('[ERROR] Unsetting emitter failed:', error);
-                  }
-                });
+                multiExec.set(NODES_EMITTER, '', unsettingEmitterCallback);
               }
               multiExec.exec(function (error) {
                 if (error) {
@@ -276,7 +278,7 @@ exports.node = function (argv) {
       }
 
       if (id) {
-        var lastActivity = (new Date()).getTime();
+        var lastActivity = Date.now();
         redisClient.batch()
           .set(NODES_EMITTER, id, function (error) {
             if (error) {
@@ -298,7 +300,8 @@ exports.node = function (argv) {
   }
 
   function _log() {
-    var i, message;
+    var i;
+    var message;
     for (i in arguments) {
       message = arguments[i];
       if (message instanceof Object) {
