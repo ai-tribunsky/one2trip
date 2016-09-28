@@ -1,17 +1,14 @@
 #!/usr/bin/env node
 'use strict';
 
+const argv = require('minimist')(process.argv.slice(2));
 const redis = require('redis');
-const redisOptions = {
-  host: '127.0.0.1',
-  port: 6379,
-  db: 1,
-  prefix: 'one2trip:'
-};
 
 // Node for distributed messages processing
-var Node = function (redisOptions) {
+exports.node = function (argv) {
   const EVENTS_QUEUE = 'nodes:queue';
+  const EVENTS_ERRORS_LIST = 'nodes:errors';
+  const EVENTS_ERRORS_LIST_TTL = 86400; // sec
   const NODES_IDS_LIST = 'nodes:ids';
   const NODES_LIST = 'nodes:list';
   const NODES_EMITTER = 'nodes:emitter';
@@ -25,7 +22,12 @@ var Node = function (redisOptions) {
   var emitEventInterval;
   var receiveEventInterval;
 
-  const redisClient = redis.createClient(redisOptions);
+  var redisClient = redis.createClient({
+    host: argv.hasOwnProperty('rhost') ? argv.rhost : '127.0.0.1',
+    port: argv.hasOwnProperty('rport') ? argv.rport : 6379,
+    db: argv.hasOwnProperty('rdb') ? argv.rdb : 0,
+    prefix: 'one2trip:'
+  });
   redisClient.on('error', function (error) {
     _log('[ERROR] Redis:', error);
     clearInterval(emitEventInterval);
@@ -33,6 +35,12 @@ var Node = function (redisOptions) {
   });
 
   function run() {
+    if (argv.hasOwnProperty('getErrors')) {
+      _getErrors(function () {
+        process.exit(-1);
+      });
+      return;
+    }
     _registerNode();
     _checkEmitter();
 
@@ -54,6 +62,24 @@ var Node = function (redisOptions) {
     );
 
     _nodesHealthCheck();
+  }
+
+  function _getErrors(onComplete) {
+    redisClient.lrange(EVENTS_ERRORS_LIST, 0, -1, function (error, errorsList) {
+      if (error) {
+        _log('[ERROR] Getting errors list failed:', error);
+        return;
+      }
+      if (null === errorsList || 0 === errorsList.length) {
+        _log('Errors list is empty');
+      } else {
+        var i;
+        for (i in errorsList) {
+          _log(errorsList[i]);
+        }
+      }
+      onComplete();
+    });
   }
 
   function _registerNode() {
@@ -97,7 +123,7 @@ var Node = function (redisOptions) {
         if (!error && reply) {
           _log('Event "' + message + '" was emitted');
         } else {
-          _log('[ERROR] Event emitting failed:', error, 'Reply:' + reply);
+          _log('[ERROR] Event emitting failed:', error, 'Reply: ' + reply);
         }
       })
       .hset(NODES_LIST, id, lastActivity, function (error) {
@@ -131,6 +157,7 @@ var Node = function (redisOptions) {
     var eventHandlerCallback = function (error, event) {
       if (error) {
         _log('Event "' + event + '" was processed with an error');
+        _saveEventWithError(event);
       } else {
         _log('Event "' + event + '" was processed successfully');
       }
@@ -153,6 +180,18 @@ var Node = function (redisOptions) {
           _log('[ERROR] Updating node last activity failed:', error);
         }
       })
+      .exec();
+  }
+
+  function _saveEventWithError(event) {
+    var message = '[' + (new Date()).toLocaleString() + '] Event: ' + event + ' (Node: ' + id + ')';
+    redisClient.batch()
+      .rpush(EVENTS_ERRORS_LIST, message, function (error) {
+        if (error) {
+          _log('[ERROR] Saving event with error failed:', error);
+        }
+      })
+      .expire(EVENTS_ERRORS_LIST, EVENTS_ERRORS_LIST_TTL)
       .exec();
   }
 
@@ -274,4 +313,4 @@ var Node = function (redisOptions) {
   };
 };
 
-Node(redisOptions).run();
+exports.node(argv).run();
